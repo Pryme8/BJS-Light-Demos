@@ -1,0 +1,97 @@
+/* ============================================================
+   BJS Light Demos — Neon Lab/Terminal Theme
+   ============================================================ */
+
+:root {
+  /* Backgrounds */
+  --bg-void:       #080b0f;
+  --bg-base:       #0d1117;
+  --bg-surface:    #111820;
+  --bg-elevated:   #171f2a;
+  --bg-hover:      #1e2a38;
+  --bg-active:     #1a2d42;
+
+  /* Borders */
+  --border-subtle: #1c2a38;
+  --border-dim:    #243347;
+  --border-bright: #2e4560;
+
+  /* Neon accents */
+  --cyan:          #00e5ff;
+  --cyan-dim:      #00b8cc;
+  --cyan-glow:     rgba(0, 229, 255, 0.15);
+  --magenta:       #ff00cc;
+  --magenta-dim:   #cc00a3;
+  --magenta-glow:  rgba(255, 0, 204, 0.12);
+  --green:         #39ff14;
+  --green-dim:     #2dcc10;
+  --amber:         #ffb700;
+
+  /* Text */
+  --text-primary:  #e8edf3;
+  --text-secondary:#8fa3b8;
+  --text-muted:    #4a6277;
+  --text-inverse:  #080b0f;
+
+  /* Typography */
+  --font-mono:     "JetBrains Mono", "Cascadia Code", "Fira Code", "Consolas", monospace;
+  --font-sans:     "Inter", system-ui, sans-serif;
+
+  /* Spacing */
+  --sidebar-w:     260px;
+  --header-h:      52px;
+  --radius-sm:     4px;
+  --radius-md:     8px;
+  --radius-lg:     12px;
+
+  /* Glow shadows */
+  --glow-cyan:     0 0 8px rgba(0, 229, 255, 0.4), 0 0 24px rgba(0, 229, 255, 0.15);
+  --glow-magenta:  0 0 8px rgba(255, 0, 204, 0.4), 0 0 24px rgba(255, 0, 204, 0.15);
+  --glow-canvas:   0 0 0 1px var(--border-bright), 0 0 24px rgba(0, 229, 255, 0.08);
+}
+
+/* ── Reset ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #app {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg-void);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-dim);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
+
+/* ── Typography helpers ── */
+.font-mono { font-family: var(--font-mono); }
+
+/* ── Utility: neon text ── */
+.neon-cyan {
+  color: var(--cyan);
+  text-shadow: var(--glow-cyan);
+}
+.neon-magenta {
+  color: var(--magenta);
+  text-shadow: var(--glow-magenta);
+}
+
+/* ── Selection ── */
+::selection {
+  background: rgba(0, 229, 255, 0.2);
+  color: var(--text-primary);
+}

@@ -1,0 +1,11 @@
+import "./basic-cube/register";
+import "./boids/register";
+import "./n-body/register";
+import "./game-of-life/register";
+import "./lotka-volterra/register";
+import "./reaction-diffusion/register";
+import "./double-pendulum/register";
+import "./l-system/register";
+import "./voronoi/register";
+import "./boids-vs-predator/register";
+import "./genetic-boids/register";
