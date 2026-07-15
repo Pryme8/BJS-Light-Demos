@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start": "vite preview"
+  },
+  "engines": {
+    "node": ">=20.19"
   },
   "dependencies": {
     "@babylonjs/lite": "^1.10.0",

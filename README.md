@@ -38,6 +38,22 @@ Then open `http://localhost:5173`.
 
 ---
 
+## Deploying (DigitalOcean App Platform)
+
+The app is a static single-page site, so the simplest deploy is a **Static Site** on App Platform:
+
+- **Build command:** `npm run build`
+- **Output directory:** `dist`
+
+An app spec is included at [`.do/app.yaml`](.do/app.yaml) — in the DO dashboard choose *Create App → Edit your app spec* and paste it (or run `doctl apps create --spec .do/app.yaml`). Every push to `master` redeploys automatically.
+
+If you'd rather run it as a **Web Service** instead of a static site:
+
+- **Build command:** `npm run build`
+- **Run command:** `npm run start`
+
+The run command starts a small preview server that binds to the platform's `PORT` automatically.
+
 ## Tech
 
 Built with [Babylon.js Lite](https://github.com/babylonjs/lite) and [Vue 3](https://vuejs.org/). Renders via WebGPU — no WebGL fallback, which is why it's fast.

@@ -1,0 +1,19 @@
+# DigitalOcean App Platform spec.
+# Recommended: deploy as a Static Site (served over DO's CDN, cheapest/fastest).
+#
+# Import this file in the DO dashboard (Create App -> "Edit your app spec"),
+# or via CLI:  doctl apps create --spec .do/app.yaml
+name: bjs-light-demos
+region: nyc
+static_sites:
+  - name: web
+    github:
+      repo: Pryme8/BJS-Light-Demos
+      branch: master
+      deploy_on_push: true
+    environment_slug: node-js
+    build_command: npm run build
+    output_dir: dist
+    # SPA fallback: serve index.html for any unknown path.
+    catchall_document: index.html
+    index_document: index.html
