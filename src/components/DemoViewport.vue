@@ -106,9 +106,8 @@ function onCanvasMount(el: Element | ComponentPublicInstance | null) {
 .viewport__description {
   font-size: 12px;
   color: var(--text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  line-height: 1.4;
 }
 
 .viewport__source-btn {

@@ -42,7 +42,7 @@ function isActive(id: string) {
                 >{{ badge }}</span>
               </span>
             </span>
-            <span class="shell__nav-desc">{{ demo.description }}</span>
+            <span class="shell__nav-desc" :title="demo.description">{{ demo.description }}</span>
           </span>
         </RouterLink>
       </nav>
@@ -223,9 +223,9 @@ function isActive(id: string) {
 .shell__nav-desc {
   font-size: 11px;
   color: var(--text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  line-height: 1.4;
+  overflow-wrap: break-word;
 }
 
 /* ── Footer ── */
