@@ -5,7 +5,8 @@ import source from "./scene.ts?raw";
 registerDemo({
   id: "boids",
   title: "Boids Flocking",
-  description: "Emergent flocking via separation, alignment, cohesion",
+  description: "CPU or GPU compute — scales to tens of thousands",
   component: defineAsyncComponent(() => import("./Boids.vue")),
   source,
+  badges: ["CPU", "GPU"],
 });
