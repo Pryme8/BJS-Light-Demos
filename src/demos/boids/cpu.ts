@@ -11,6 +11,9 @@ export interface CpuBoidsParams {
   cohesion: number;
   radius: number;
   separationRadius: number;
+  collision: boolean;
+  collisionRadius: number;
+  collisionStrength: number;
 }
 
 export class CpuBoids {
@@ -33,6 +36,10 @@ export class CpuBoids {
   private readonly cz2: Float32Array;
   private readonly nc: Int32Array;
   private readonly ns: Int32Array;
+  // Positional collision-pushout accumulators
+  private readonly cpx: Float32Array;
+  private readonly cpy: Float32Array;
+  private readonly cpz: Float32Array;
 
   constructor(capacity: number) {
     this.capacity = capacity;
@@ -53,6 +60,9 @@ export class CpuBoids {
     this.cz2 = new Float32Array(capacity);
     this.nc = new Int32Array(capacity);
     this.ns = new Int32Array(capacity);
+    this.cpx = new Float32Array(capacity);
+    this.cpy = new Float32Array(capacity);
+    this.cpz = new Float32Array(capacity);
   }
 
   spawnOne(i: number): void {
@@ -81,12 +91,17 @@ export class CpuBoids {
     const r2 = r * r;
     const sr = params.separationRadius;
     const sr2 = sr * sr;
+    const doCollision = params.collision;
+    const collDist  = 2 * params.collisionRadius;
+    const collDist2 = collDist * collDist;
+    const collStr   = params.collisionStrength;
 
     for (let i = 0; i < n; i++) {
       this.sx2[i] = this.sy2[i] = this.sz2[i] = 0;
       this.ax[i] = this.ay[i] = this.az[i] = 0;
       this.cx2[i] = this.cy2[i] = this.cz2[i] = 0;
       this.nc[i] = this.ns[i] = 0;
+      this.cpx[i] = this.cpy[i] = this.cpz[i] = 0;
     }
 
     for (let i = 0; i < n - 1; i++) {
@@ -106,6 +121,14 @@ export class CpuBoids {
             this.sx2[j] += dx; this.sy2[j] += dy; this.sz2[j] += dz;
             this.ns[i]++; this.ns[j]++;
           }
+        }
+        // Soft collision: direct positional pushout (independent of steering).
+        // collDist is small (~0.8) and always < r (~5), so no extra loop needed.
+        if (doCollision && d2 < collDist2 && d2 > 1e-8) {
+          const d    = Math.sqrt(d2);
+          const push = (collDist - d) * 0.5 * collStr / d;
+          this.cpx[i] -= dx * push; this.cpy[i] -= dy * push; this.cpz[i] -= dz * push;
+          this.cpx[j] += dx * push; this.cpy[j] += dy * push; this.cpz[j] += dz * push;
         }
       }
     }
@@ -148,6 +171,13 @@ export class CpuBoids {
       this.px[i] += this.vx[i] * s;
       this.py[i] += this.vy[i] * s;
       this.pz[i] += this.vz[i] * s;
+
+      // Apply positional collision pushout after normal integration.
+      if (doCollision) {
+        this.px[i] += this.cpx[i];
+        this.py[i] += this.cpy[i];
+        this.pz[i] += this.cpz[i];
+      }
 
       const [qx, qy, qz, qw] = upToDirQuat(this.vx[i], this.vy[i], this.vz[i]);
       buf.writeTransform(i, this.px[i], this.py[i], this.pz[i], qx, qy, qz, qw, 1, 1, 1);

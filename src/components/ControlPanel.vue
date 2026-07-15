@@ -37,11 +37,27 @@ function isVisible(idx: number): boolean {
   return true; // no parent section → always visible
 }
 
+// Sliders commit to params only on release. While dragging, the value lives in
+// dragValues (local) so the thumb + number stay live without re-running the sim
+// every frame; on `change` (pointer release / keyboard commit) it is written to
+// params.
+const dragValues = reactive<Record<string, number>>({});
+
 function getSliderValue(key: string): number {
   return (props.params[key] ?? 0) as number;
 }
-function setSliderValue(key: string, v: string): void {
+/** Display value: the in-progress drag value if dragging, else the committed param. */
+function getSliderDisplay(key: string): number {
+  return dragValues[key] ?? getSliderValue(key);
+}
+/** During drag: update the local value only (does not touch params). */
+function onSliderInput(key: string, v: string): void {
+  dragValues[key] = parseFloat(v);
+}
+/** On release: commit the dragged value to params, then drop the local override. */
+function onSliderChange(key: string, v: string): void {
   (props.params as Record<string, unknown>)[key] = parseFloat(v);
+  delete dragValues[key];
 }
 function getToggleValue(key: string): boolean {
   return props.params[key] as boolean;
@@ -103,11 +119,11 @@ function setRangeVal(key: string, v: number): void {
         <!-- Everything else — hidden when inside a collapsed section -->
         <div v-else-if="isVisible(idx)" class="cp__param">
 
-          <!-- Slider -->
+          <!-- Slider (commits on release; live-updates the display while dragging) -->
           <template v-if="def.type === 'slider'">
             <div class="cp__param-row">
               <label class="cp__label font-mono">{{ def.label }}</label>
-              <span class="cp__val font-mono">{{ (getSliderValue(def.key) ?? 0).toFixed(def.step < 1 ? 2 : 0) }}</span>
+              <span class="cp__val font-mono">{{ (getSliderDisplay(def.key) ?? 0).toFixed(def.step < 1 ? 2 : 0) }}</span>
             </div>
             <input
               type="range"
@@ -115,8 +131,9 @@ function setRangeVal(key: string, v: number): void {
               :min="def.min"
               :max="def.max"
               :step="def.step"
-              :value="getSliderValue(def.key)"
-              @input="setSliderValue(def.key, ($event.target as HTMLInputElement).value)"
+              :value="getSliderDisplay(def.key)"
+              @input="onSliderInput(def.key, ($event.target as HTMLInputElement).value)"
+              @change="onSliderChange(def.key, ($event.target as HTMLInputElement).value)"
             />
           </template>
 

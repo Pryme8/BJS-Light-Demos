@@ -1,48 +1,63 @@
 /**
- * GPU Boids — compute-only approach with async CPU readback.
+ * GPU Boids — fully GPU-driven rendering (no readback), bucketed uniform grid.
  *
- * The spatial-grid compute pipeline (clear→count→scan→scatter→simulate) runs
- * fully on the GPU and scales to tens of thousands of boids. After each
- * dispatch the front buffer is copied to a staging buffer and `mapAsync` is
- * started non-blocking. When the mapping resolves (typically next frame),
- * `consumeReadback()` returns the count and the px/py/pz/vx/vy/vz arrays are
- * populated, ready for the caller to write into an AgentBuffer for rendering
- * with the standard PBR + thin-instance path.
+ * Boids are O(n × neighbors), unlike independent particles (O(n)). To keep it
+ * fast at 200k we bound the neighbor work two ways:
  *
- * This mirrors how bjs-webgpu-particles/Emitter.ts handles sub-emitters:
- * GPU computes positions, async readback drives the rendering side.
+ *   1. Bucketed uniform grid with FIXED per-cell capacity (MaxPerCell). Each
+ *      boid is scattered into its cell's bucket via one atomicAdd; overflow past
+ *      MaxPerCell is dropped. The simulate pass scans the 3×3×3 neighbor cells,
+ *      visiting at most 27×MaxPerCell candidates per boid — a hard cap. This also
+ *      removes the serial prefix-sum scan (which itself doesn't scale).
+ *   2. Density-scaled domain: the world bound and grid resolution grow with the
+ *      boid count so boids-per-cell (and thus candidates per boid) stays roughly
+ *      constant — genuinely O(n).
  *
- * Compute passes per frame (single command encoder, single submit):
- *   0. clear   — zero cellCount atomics (required every frame — scatter leaves
- *                cellCount at the per-cell count, which doubles on the next
- *                COUNT pass if not cleared first)
- *   1. count   — each boid increments its cell counter
- *   2. scan    — single-thread sequential prefix sum → cellStart[], sentinel
- *   3. scatter — place boid indices into sorted slots
- *   4. simulate— integrate forces, write back pos/vel to back buffer
+ * Rendering is the ordinary PBR thin-instance path (same as the CPU boids). The
+ * simulate pass writes each boid's column-major TRS mat4 into matBuf and RGBA
+ * into colBuf; those are OWNED here and handed to Lite as the mesh's instance
+ * matrix/color vertex buffers, with versions synced so Lite never overwrites them.
  */
 
-import type { EngineContext } from "@babylonjs/lite";
+import {
+  addToScene,
+  createCapsule,
+  createPbrMaterial,
+  invalidateRenderBundles,
+  setThinInstanceColors,
+  setThinInstanceCount,
+  setThinInstances,
+} from "@babylonjs/lite";
+import type { EngineContext, Mesh, SceneContext } from "@babylonjs/lite";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
 export const GpuCapacity = 200_000;
 
-const Bound = 20;
-const GridDim = 8;
-const TotalCells = GridDim * GridDim * GridDim; // 512
+const GridDimMax = 32;
+const MaxCells   = GridDimMax * GridDimMax * GridDimMax; // 32768
+const MaxPerCell = 64;                                    // hard neighbor-candidate cap per cell
 
 // Boid state: 2 × vec4<f32> per boid = 32 bytes
-//   posT: vec4(x, y, z, colorT)
-//   vel:  vec4(vx, vy, vz, 0)
 const BytesPerBoid = 32;
 
-// UBO: 16 × f32 = 64 bytes
+// UBO: 16 × 4 bytes
 const UBOWords = 16;
+
+/**
+ * Density-scaled world half-extent for a given boid count.
+ * Grows ∝ cbrt(count) above a baseline so density (and neighbors/boid) stays
+ * roughly constant. Floored at 20 so small counts keep the original framing.
+ */
+export function gpuBoundForCount(count: number): number {
+  return Math.max(20, 20 * Math.cbrt(count / 2000));
+}
 
 // ── WGSL common ─────────────────────────────────────────────────────────────
 
 const WGSL_COMMON = /* wgsl */ `
+const MAX_PER_CELL : u32 = ${MaxPerCell}u;
+
 struct Params {
   count       : u32,
   dt          : f32,
@@ -56,7 +71,10 @@ struct Params {
   gridDim     : u32,
   cellSize    : f32,
   invCellSize : f32,
-  _p0 : u32, _p1 : u32, _p2 : u32, _p3 : u32,
+  cellCountU   : u32,
+  collRadius   : f32,
+  collStrength : f32,
+  collEnabled  : u32,
 }
 
 struct Boid {
@@ -73,7 +91,7 @@ fn cellOf(p : vec3<f32>, dim : u32, invCS : f32, bound : f32) -> u32 {
 }
 `;
 
-// ── Pass 0: clear cell counts (required every frame) ─────────────────────────
+// ── Pass 0: clear cell counts ────────────────────────────────────────────────
 
 const WGSL_CLEAR = /* wgsl */ `
 ${WGSL_COMMON}
@@ -83,80 +101,53 @@ ${WGSL_COMMON}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
-  if (i >= params.gridDim * params.gridDim * params.gridDim) { return; }
+  if (i >= params.cellCountU) { return; }
   atomicStore(&cellCount[i], 0u);
 }
 `;
 
-// ── Pass 1: count boids per cell ─────────────────────────────────────────────
+// ── Pass 1: scatter boids into fixed-size cell buckets ───────────────────────
 
-const WGSL_COUNT = /* wgsl */ `
+const WGSL_SCATTER = /* wgsl */ `
 ${WGSL_COMMON}
 @group(0) @binding(0) var<uniform>             params    : Params;
 @group(0) @binding(1) var<storage, read>       front     : array<Boid>;
 @group(0) @binding(3) var<storage, read_write> cellCount : array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> cellBoids : array<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= params.count) { return; }
-  let c = cellOf(front[i].posT.xyz, params.gridDim, params.invCellSize, params.bound);
-  atomicAdd(&cellCount[c], 1u);
-}
-`;
-
-// ── Pass 2: sequential prefix scan → cellStart + sentinel ───────────────────
-
-const WGSL_SCAN = /* wgsl */ `
-${WGSL_COMMON}
-@group(0) @binding(0) var<uniform>             params    : Params;
-@group(0) @binding(3) var<storage, read_write> cellCount : array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read_write> cellStart : array<u32>;
-
-@compute @workgroup_size(1)
-fn main() {
-  let total = params.gridDim * params.gridDim * params.gridDim;
-  var sum = 0u;
-  for (var i = 0u; i <= total; i++) {
-    cellStart[i] = sum;
-    if (i < total) {
-      let cnt = atomicLoad(&cellCount[i]);
-      sum += cnt;
-      atomicStore(&cellCount[i], 0u);  // reset for scatter
-    }
+  let c    = cellOf(front[i].posT.xyz, params.gridDim, params.invCellSize, params.bound);
+  let slot = atomicAdd(&cellCount[c], 1u);
+  if (slot < MAX_PER_CELL) {
+    cellBoids[c * MAX_PER_CELL + slot] = i;
   }
 }
 `;
 
-// ── Pass 3: scatter boid indices into sorted slots ───────────────────────────
-
-const WGSL_SCATTER = /* wgsl */ `
-${WGSL_COMMON}
-@group(0) @binding(0) var<uniform>             params        : Params;
-@group(0) @binding(1) var<storage, read>       front         : array<Boid>;
-@group(0) @binding(3) var<storage, read_write> cellCount     : array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read_write> cellStart     : array<u32>;
-@group(0) @binding(5) var<storage, read_write> sortedIndices : array<u32>;
-
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let i = gid.x;
-  if (i >= params.count) { return; }
-  let c   = cellOf(front[i].posT.xyz, params.gridDim, params.invCellSize, params.bound);
-  let off = cellStart[c] + atomicAdd(&cellCount[c], 1u);
-  sortedIndices[off] = i;
-}
-`;
-
-// ── Pass 4: simulate — neighbor scan + integrate ──────────────────────────────
+// ── Pass 2: simulate — scan 3×3×3 buckets, integrate, write matrix + color ───
 
 const WGSL_SIMULATE = /* wgsl */ `
 ${WGSL_COMMON}
-@group(0) @binding(0) var<uniform>             params        : Params;
-@group(0) @binding(1) var<storage, read>       front         : array<Boid>;
-@group(0) @binding(2) var<storage, read_write> back          : array<Boid>;
-@group(0) @binding(4) var<storage, read_write> cellStart     : array<u32>;
-@group(0) @binding(5) var<storage, read_write> sortedIndices : array<u32>;
+@group(0) @binding(0) var<uniform>             params    : Params;
+@group(0) @binding(1) var<storage, read>       front     : array<Boid>;
+@group(0) @binding(2) var<storage, read_write> back      : array<Boid>;
+@group(0) @binding(3) var<storage, read_write> cellCount : array<u32>;
+@group(0) @binding(4) var<storage, read_write> cellBoids : array<u32>;
+@group(0) @binding(5) var<storage, read_write> matBuf    : array<f32>;
+@group(0) @binding(6) var<storage, read_write> colBuf    : array<f32>;
+
+fn upToDirQuat(d : vec3<f32>) -> vec4<f32> {
+  let len = length(d);
+  if (len < 1e-6) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+  let f = d / len;
+  if (f.y < -0.999999) { return vec4<f32>(1.0, 0.0, 0.0, 0.0); }
+  let w   = 1.0 + f.y;
+  let inv = 1.0 / sqrt(2.0 * w);
+  return vec4<f32>(f.z * inv, 0.0, -f.x * inv, w * inv);
+}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -174,10 +165,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let r2  = params.radius    * params.radius;
   let sr2 = params.sepRadius * params.sepRadius;
 
-  var sepF   = vec3<f32>(0.0);
-  var aliSum = vec3<f32>(0.0);
-  var cohSum = vec3<f32>(0.0);
-  var nc     = 0u;
+  var sepF     = vec3<f32>(0.0);
+  var aliSum   = vec3<f32>(0.0);
+  var cohSum   = vec3<f32>(0.0);
+  var collPush = vec3<f32>(0.0);
+  var nc       = 0u;
   var ns     = 0u;
 
   for (var dz = -1; dz <= 1; dz++) {
@@ -187,11 +179,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         if (nx < 0 || ny < 0 || nz < 0) { continue; }
         let unx = u32(nx);  let uny = u32(ny);  let unz = u32(nz);
         if (unx >= dim || uny >= dim || unz >= dim) { continue; }
-        let cell  = unx + uny * dim + unz * dim * dim;
-        let start = cellStart[cell];
-        let endC  = cellStart[cell + 1u];
-        for (var k = start; k < endC; k++) {
-          let j = sortedIndices[k];
+        let cell = unx + uny * dim + unz * dim * dim;
+        let cnt  = min(cellCount[cell], MAX_PER_CELL);
+        let base = cell * MAX_PER_CELL;
+        for (var s = 0u; s < cnt; s++) {
+          let j = cellBoids[base + s];
           if (j == i) { continue; }
           let dp = front[j].posT.xyz - pos;
           let d2 = dot(dp, dp);
@@ -200,6 +192,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
           cohSum += front[j].posT.xyz;
           nc++;
           if (d2 < sr2) { sepF -= dp; ns++; }
+          // Soft collision pushout (independent of flocking, same scan pass).
+          if (params.collEnabled == 1u) {
+            let collDist = 2.0 * params.collRadius;
+            if (d2 < collDist * collDist && d2 > 1e-8) {
+              let d    = sqrt(d2);
+              let push = (collDist - d) * 0.5 * params.collStrength / d;
+              collPush -= dp * push;
+            }
+          }
         }
       }
     }
@@ -225,13 +226,48 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let vLen   = length(newVel);
   if (vLen > 0.001) { newVel = newVel * (params.speed / vLen); }
 
-  let newPos = pos + newVel * params.dt;
-  let colorT = clamp(vLen / (params.speed * 1.5), 0.0, 1.0);
+  let newPos   = pos + newVel * params.dt;
+  // Apply positional collision pushout after normal integration.
+  let finalPos = newPos + collPush;
+  let colorT   = clamp(vLen / (params.speed * 1.5), 0.0, 1.0);
 
-  back[i].posT = vec4<f32>(newPos, colorT);
+  back[i].posT = vec4<f32>(finalPos, colorT);
   back[i].vel  = vec4<f32>(newVel, 0.0);
+
+  // ── Column-major TRS mat4 (matches AgentBuffer.writeTransform) ───────────
+  let q  = upToDirQuat(newVel);
+  let qx = q.x; let qy = q.y; let qz = q.z; let qw = q.w;
+  let x2 = qx + qx; let y2 = qy + qy; let z2 = qz + qz;
+  let xx = qx * x2; let xy = qx * y2; let xz = qx * z2;
+  let yy = qy * y2; let yz = qy * z2; let zz = qz * z2;
+  let wx = qw * x2; let wy = qw * y2; let wz = qw * z2;
+
+  let mb = i * 16u;
+  matBuf[mb +  0u] = 1.0 - (yy + zz); matBuf[mb +  1u] = xy + wz;         matBuf[mb +  2u] = xz - wy;         matBuf[mb +  3u] = 0.0;
+  matBuf[mb +  4u] = xy - wz;         matBuf[mb +  5u] = 1.0 - (xx + zz); matBuf[mb +  6u] = yz + wx;         matBuf[mb +  7u] = 0.0;
+  matBuf[mb +  8u] = xz + wy;         matBuf[mb +  9u] = yz - wx;         matBuf[mb + 10u] = 1.0 - (xx + yy); matBuf[mb + 11u] = 0.0;
+  matBuf[mb + 12u] = finalPos.x;      matBuf[mb + 13u] = finalPos.y;      matBuf[mb + 14u] = finalPos.z;      matBuf[mb + 15u] = 1.0;
+
+  let cb = i * 4u;
+  colBuf[cb +  0u] = colorT;
+  colBuf[cb +  1u] = 1.0 - colorT * 0.8;
+  colBuf[cb +  2u] = 1.0 - colorT * 0.4;
+  colBuf[cb +  3u] = 1.0;
 }
 `;
+
+// ── Internal thin-instance shape we mutate for buffer ownership ──────────────
+
+type ThinInstData = {
+  _gpuBuffer: GPUBuffer | null;
+  _gpuBufferStorage: boolean;
+  _gpuVersion: number;
+  _version: number;
+  _colorGpuBuffer: GPUBuffer | null;
+  _colorGpuBufferStorage: boolean;
+  _colorGpuVersion: number;
+  _colorVersion: number;
+};
 
 // ── GpuBoids ─────────────────────────────────────────────────────────────────
 
@@ -243,94 +279,103 @@ export interface GpuBoidsParams {
   cohesion: number;
   radius: number;
   separationRadius: number;
+  collision: boolean;
+  collisionRadius: number;
+  collisionStrength: number;
 }
 
 export class GpuBoids {
-  private readonly device: GPUDevice;
+  readonly mesh: Mesh;
 
-  // Ping-pong boid state
+  private readonly engine: EngineContext;
+  private readonly device: GPUDevice;
+  private readonly ti: ThinInstData;
+
   private stateA: GPUBuffer;
   private stateB: GPUBuffer;
   private front: GPUBuffer;
   private back: GPUBuffer;
 
-  // Grid buffers
-  private readonly cellCount: GPUBuffer;
-  private readonly cellStart: GPUBuffer;   // TotalCells + 1 (sentinel)
-  private readonly sortedIndices: GPUBuffer;
+  private readonly matBuf: GPUBuffer;
+  private readonly colBuf: GPUBuffer;
 
-  // UBO
+  private readonly cellCount: GPUBuffer;
+  private readonly cellBoids: GPUBuffer;
+
   private readonly ubo: GPUBuffer;
   private readonly uboData: Float32Array;
 
-  // Compute
   private readonly bgl: GPUBindGroupLayout;
   private readonly clearPipeline: GPUComputePipeline;
-  private readonly countPipeline: GPUComputePipeline;
-  private readonly scanPipeline: GPUComputePipeline;
   private readonly scatterPipeline: GPUComputePipeline;
   private readonly simulatePipeline: GPUComputePipeline;
   private readonly bgA: GPUBindGroup;
   private readonly bgB: GPUBindGroup;
 
-  // Async readback
-  private readonly stagingBuf: GPUBuffer;
-  private readbackPending: boolean = false;
-  private readbackResolvedCount: number = 0;
-
-  // Output arrays — populated by readback, consumed by scene.ts each frame
-  readonly px: Float32Array = new Float32Array(GpuCapacity);
-  readonly py: Float32Array = new Float32Array(GpuCapacity);
-  readonly pz: Float32Array = new Float32Array(GpuCapacity);
-  readonly vx: Float32Array = new Float32Array(GpuCapacity);
-  readonly vy: Float32Array = new Float32Array(GpuCapacity);
-  readonly vz: Float32Array = new Float32Array(GpuCapacity);
-  readonly colorT: Float32Array = new Float32Array(GpuCapacity);
-
   private _ok = false;
   get ok(): boolean { return this._ok; }
 
-  constructor(engine: EngineContext) {
+  constructor(engine: EngineContext, scene: SceneContext) {
+    this.engine = engine;
     const dev = (engine as unknown as { _device: GPUDevice })._device;
     this.device = dev;
 
-    // ── Boid state buffers ────────────────────────────────────────────────
+    // Owned instance vertex buffers.
+    const instUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST;
+    this.matBuf = dev.createBuffer({ label: "boids-mat", size: GpuCapacity * 64, usage: instUsage });
+    this.colBuf = dev.createBuffer({ label: "boids-col", size: GpuCapacity * 16, usage: instUsage });
+
+    // PBR thin-instanced mesh (same render path as CPU boids).
+    const capsule = createCapsule(engine, { height: 1.2, radius: 0.35, tessellation: 6 });
+    capsule.material = createPbrMaterial({ baseColorFactor: [0.05, 0.8, 1, 1], metallicFactor: 0.2, roughnessFactor: 0.5 });
+    addToScene(scene, capsule);
+    this.mesh = capsule;
+
+    const identities = new Float32Array(GpuCapacity * 16);
+    for (let i = 0; i < GpuCapacity; i++) {
+      const b = i * 16;
+      identities[b] = 1; identities[b + 5] = 1; identities[b + 10] = 1; identities[b + 15] = 1;
+    }
+    const colorsPlaceholder = new Float32Array(GpuCapacity * 4).fill(1);
+
+    setThinInstances(capsule, identities, GpuCapacity);
+    setThinInstanceColors(capsule, colorsPlaceholder);
+    setThinInstanceCount(capsule, 0);
+
+    const ti = (capsule as unknown as { thinInstances: ThinInstData }).thinInstances;
+    ti._gpuBuffer             = this.matBuf;
+    ti._gpuBufferStorage      = false;
+    ti._gpuVersion            = ti._version;
+    ti._colorGpuBuffer        = this.colBuf;
+    ti._colorGpuBufferStorage = false;
+    ti._colorGpuVersion       = ti._colorVersion;
+    this.ti = ti;
+
+    // State ping-pong.
     const stateUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
     this.stateA = dev.createBuffer({ label: "boids-stateA", size: GpuCapacity * BytesPerBoid, usage: stateUsage });
     this.stateB = dev.createBuffer({ label: "boids-stateB", size: GpuCapacity * BytesPerBoid, usage: stateUsage });
     this.front = this.stateA;
     this.back  = this.stateB;
 
-    // Staging buffer for async GPU→CPU readback (MAP_READ + COPY_DST)
-    this.stagingBuf = dev.createBuffer({
-      label: "boids-staging",
-      size: GpuCapacity * BytesPerBoid,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-
-    // ── Spatial grid buffers ──────────────────────────────────────────────
+    // Grid: fixed-capacity buckets.
     const gridUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
-    this.cellCount     = dev.createBuffer({ label: "cellCount",  size: TotalCells * 4,       usage: gridUsage });
-    this.cellStart     = dev.createBuffer({ label: "cellStart",  size: (TotalCells + 1) * 4, usage: gridUsage });
-    this.sortedIndices = dev.createBuffer({ label: "sortedIdx",  size: GpuCapacity * 4,      usage: GPUBufferUsage.STORAGE });
+    this.cellCount = dev.createBuffer({ label: "cellCount", size: MaxCells * 4,              usage: gridUsage });
+    this.cellBoids = dev.createBuffer({ label: "cellBoids", size: MaxCells * MaxPerCell * 4, usage: gridUsage });
 
     this.uboData = new Float32Array(UBOWords);
     this.ubo     = dev.createBuffer({ label: "boidsUBO", size: UBOWords * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
-    // ── Compute pipelines ─────────────────────────────────────────────────
     try {
       this.bgl              = this.buildBGL();
       this.clearPipeline    = this.buildComputePipeline("clear",    WGSL_CLEAR);
-      this.countPipeline    = this.buildComputePipeline("count",    WGSL_COUNT);
-      this.scanPipeline     = this.buildComputePipeline("scan",     WGSL_SCAN);
       this.scatterPipeline  = this.buildComputePipeline("scatter",  WGSL_SCATTER);
       this.simulatePipeline = this.buildComputePipeline("simulate", WGSL_SIMULATE);
       this.bgA = this.buildBG("A", this.stateA, this.stateB);
       this.bgB = this.buildBG("B", this.stateB, this.stateA);
     } catch (e) {
       console.error("[GpuBoids] pipeline build failed:", e);
-      this.bgl = null!; this.clearPipeline = null!; this.countPipeline = null!;
-      this.scanPipeline = null!; this.scatterPipeline = null!; this.simulatePipeline = null!;
+      this.bgl = null!; this.clearPipeline = null!; this.scatterPipeline = null!; this.simulatePipeline = null!;
       this.bgA = null!; this.bgB = null!;
       return;
     }
@@ -345,9 +390,10 @@ export class GpuBoids {
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }, // cellCount
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }, // cellBoids
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }, // matBuf
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }, // colBuf
       ],
     });
   }
@@ -370,133 +416,46 @@ export class GpuBoids {
         { binding: 1, resource: { buffer: front } },
         { binding: 2, resource: { buffer: back } },
         { binding: 3, resource: { buffer: this.cellCount } },
-        { binding: 4, resource: { buffer: this.cellStart } },
-        { binding: 5, resource: { buffer: this.sortedIndices } },
+        { binding: 4, resource: { buffer: this.cellBoids } },
+        { binding: 5, resource: { buffer: this.matBuf } },
+        { binding: 6, resource: { buffer: this.colBuf } },
       ],
     });
   }
 
-  /** Seed boid state from CPU arrays (instant writeBuffer). */
+  setCount(n: number): void {
+    setThinInstanceCount(this.mesh, n);
+    this.ti._gpuVersion      = this.ti._version;
+    this.ti._colorGpuVersion = this.ti._colorVersion;
+    invalidateRenderBundles(this.engine);
+  }
+
+  /** Seamless CPU→GPU seed: copy [0,count) from CPU arrays, spread the rest. */
   seedFrom(
     count: number,
     px: Float32Array, py: Float32Array, pz: Float32Array,
     vx: Float32Array, vy: Float32Array, vz: Float32Array,
   ): void {
+    const bound = gpuBoundForCount(count);
     const data = new Float32Array(GpuCapacity * 8);
     for (let i = 0; i < count; i++) {
       const b = i * 8;
       data[b] = px[i]; data[b + 1] = py[i]; data[b + 2] = pz[i]; data[b + 3] = 0;
       data[b + 4] = vx[i]; data[b + 5] = vy[i]; data[b + 6] = vz[i]; data[b + 7] = 0;
     }
-    for (let i = count; i < GpuCapacity; i++) {
-      const b = i * 8;
-      const a = Math.random() * Math.PI * 2;
-      data[b]     = (Math.random() - 0.5) * 40;
-      data[b + 1] = (Math.random() - 0.5) * 20;
-      data[b + 2] = (Math.random() - 0.5) * 40;
-      data[b + 4] = Math.cos(a); data[b + 5] = 0.1; data[b + 6] = Math.sin(a);
-    }
+    for (let i = count; i < GpuCapacity; i++) writeSpread(data, i, bound);
     this.device.queue.writeBuffer(this.front, 0, data);
-    // Also pre-populate output arrays so the first render frame shows something
-    for (let i = 0; i < count; i++) {
-      this.px[i] = px[i]; this.py[i] = py[i]; this.pz[i] = pz[i];
-      this.vx[i] = vx[i]; this.vy[i] = vy[i]; this.vz[i] = vz[i];
-      this.colorT[i] = 0;
-    }
-    this.readbackResolvedCount = count;
   }
 
-  /**
-   * Dispatch one frame of compute and start a non-blocking readback.
-   * dt is in milliseconds.
-   */
-  dispatch(dt: number, params: GpuBoidsParams): void {
-    if (!this._ok) return;
-    const n = params.count;
-
-    // Update UBO
-    const u    = this.uboData;
-    const uU32 = new Uint32Array(u.buffer);
-    uU32[0] = n;
-    u[1]  = dt * 0.001;
-    u[2]  = params.speed;
-    u[3]  = params.separation;
-    u[4]  = params.alignment;
-    u[5]  = params.cohesion;
-    u[6]  = params.radius;
-    u[7]  = params.separationRadius;
-    u[8]  = Bound;
-    uU32[9] = GridDim;
-    const cs = (Bound * 2 * 1.1) / GridDim;
-    u[10] = cs;
-    u[11] = 1 / cs;
-    this.device.queue.writeBuffer(this.ubo, 0, u);
-
-    const bg      = this.front === this.stateA ? this.bgA : this.bgB;
-    const wgN64   = Math.ceil(n / 64);
-    const wgCells = Math.ceil(TotalCells / 64); // ceil(512/64) = 8
-
-    // Compute passes
-    const enc  = this.device.createCommandEncoder({ label: "boids-compute" });
-    const pass = enc.beginComputePass({ label: "boids" });
-    pass.setPipeline(this.clearPipeline);    pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgCells);
-    pass.setPipeline(this.countPipeline);    pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgN64);
-    pass.setPipeline(this.scanPipeline);     pass.setBindGroup(0, bg); pass.dispatchWorkgroups(1);
-    pass.setPipeline(this.scatterPipeline);  pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgN64);
-    pass.setPipeline(this.simulatePipeline); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgN64);
-    pass.end();
-    this.device.queue.submit([enc.finish()]);
-
-    // Ping-pong: front now points at the freshly-computed buffer.
-    const tmp  = this.front;
-    this.front = this.back;
-    this.back  = tmp;
-
-    // Read back ONLY when no map is in flight. Copying into a buffer that is
-    // pending-map (or mapped) is a WebGPU validation error that would drop the
-    // submit and freeze the sim — so the copy and the mapAsync are done
-    // together, guarded by readbackPending.
-    if (!this.readbackPending) {
-      this.readbackPending = true;
-      const count    = n;
-      const copySize = n * BytesPerBoid;
-
-      const enc2 = this.device.createCommandEncoder({ label: "boids-readback" });
-      enc2.copyBufferToBuffer(this.front, 0, this.stagingBuf, 0, copySize);
-      this.device.queue.submit([enc2.finish()]);
-
-      this.stagingBuf.mapAsync(GPUMapMode.READ, 0, copySize).then(() => {
-        const src = new Float32Array(this.stagingBuf.getMappedRange(0, copySize));
-        for (let i = 0; i < count; i++) {
-          const b = i * 8;
-          this.px[i]     = src[b];
-          this.py[i]     = src[b + 1];
-          this.pz[i]     = src[b + 2];
-          this.colorT[i] = src[b + 3];
-          this.vx[i]     = src[b + 4];
-          this.vy[i]     = src[b + 5];
-          this.vz[i]     = src[b + 6];
-        }
-        this.stagingBuf.unmap();
-        this.readbackResolvedCount = count;
-        this.readbackPending = false;
-      }).catch((e) => {
-        console.error("[GpuBoids] readback failed:", e);
-        this.readbackPending = false;
-      });
-    }
+  /** Reseed [0,n) spread across the density-scaled world (used on count change). */
+  spawnSpread(n: number): void {
+    const bound = gpuBoundForCount(n);
+    const data = new Float32Array(n * 8);
+    for (let i = 0; i < n; i++) writeSpread(data, i, bound);
+    this.device.queue.writeBuffer(this.front, 0, data, 0, n * 8);
   }
 
-  /**
-   * Returns the most recently resolved readback count (0 if none yet).
-   * The caller should then read px/py/pz/vx/vy/vz/colorT arrays.
-   */
-  get readbackCount(): number { return this.readbackResolvedCount; }
-
-  /**
-   * For seamless GPU→CPU handoff: async readback the latest front buffer
-   * into the caller-supplied arrays.
-   */
+  /** One-shot async GPU→CPU readback (for GPU→CPU handoff). */
   async readbackInto(
     count: number,
     px: Float32Array, py: Float32Array, pz: Float32Array,
@@ -518,13 +477,73 @@ export class GpuBoids {
     staging.destroy();
   }
 
+  /** Dispatch one frame of compute. dt is in milliseconds. No readback. */
+  dispatch(dt: number, params: GpuBoidsParams): void {
+    if (!this._ok) return;
+    const n = params.count;
+
+    // Density-scaled grid: cells sized ~= neighbor radius, world grows with count.
+    const bound       = gpuBoundForCount(n);
+    const radius      = Math.max(params.radius, 0.5);
+    const worldExtent = 2 * bound * 1.1;
+    const gridDim     = Math.max(2, Math.min(GridDimMax, Math.floor(worldExtent / radius)));
+    const cellSize    = worldExtent / gridDim;
+    const cells       = gridDim * gridDim * gridDim;
+
+    const u    = this.uboData;
+    const uU32 = new Uint32Array(u.buffer);
+    uU32[0] = n;
+    u[1]  = dt * 0.001;
+    u[2]  = params.speed;
+    u[3]  = params.separation;
+    u[4]  = params.alignment;
+    u[5]  = params.cohesion;
+    u[6]  = params.radius;
+    u[7]  = params.separationRadius;
+    u[8]  = bound;
+    uU32[9] = gridDim;
+    u[10] = cellSize;
+    u[11] = 1 / cellSize;
+    uU32[12] = cells;
+    u[13]    = params.collisionRadius;
+    u[14]    = params.collisionStrength;
+    uU32[15] = params.collision ? 1 : 0;
+    this.device.queue.writeBuffer(this.ubo, 0, u);
+
+    const bg      = this.front === this.stateA ? this.bgA : this.bgB;
+    const wgN64   = Math.ceil(n / 64);
+    const wgCells = Math.ceil(cells / 64);
+
+    const enc  = this.device.createCommandEncoder({ label: "boids-compute" });
+    const pass = enc.beginComputePass({ label: "boids" });
+    pass.setPipeline(this.clearPipeline);    pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgCells);
+    pass.setPipeline(this.scatterPipeline);  pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgN64);
+    pass.setPipeline(this.simulatePipeline); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(wgN64);
+    pass.end();
+    this.device.queue.submit([enc.finish()]);
+
+    const tmp  = this.front;
+    this.front = this.back;
+    this.back  = tmp;
+  }
+
   destroy(): void {
     this.stateA.destroy();
     this.stateB.destroy();
-    this.stagingBuf.destroy();
+    this.matBuf.destroy();
+    this.colBuf.destroy();
     this.cellCount.destroy();
-    this.cellStart.destroy();
-    this.sortedIndices.destroy();
+    this.cellBoids.destroy();
     this.ubo.destroy();
   }
+}
+
+/** Write a single spread boid (random pos within the scaled world + random heading). */
+function writeSpread(data: Float32Array, i: number, bound: number): void {
+  const b = i * 8;
+  const a = Math.random() * Math.PI * 2;
+  data[b]     = (Math.random() - 0.5) * bound * 1.8;
+  data[b + 1] = (Math.random() - 0.5) * bound * 0.9;
+  data[b + 2] = (Math.random() - 0.5) * bound * 1.8;
+  data[b + 4] = Math.cos(a); data[b + 5] = 0.1; data[b + 6] = Math.sin(a);
 }

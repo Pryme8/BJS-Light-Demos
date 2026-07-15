@@ -7,17 +7,18 @@ import {
   createHemisphericLight,
   createPbrMaterial,
   invalidateRenderBundles,
+  setThinInstanceCount,
 } from "@babylonjs/lite";
 import type { EngineContext, SceneContext } from "@babylonjs/lite";
-import { AgentBuffer, upToDirQuat } from "@/lib/agents";
+import { AgentBuffer } from "@/lib/agents";
 import type { SimHandle, SliderParam } from "@/types/sim";
 import { CpuBoids } from "./cpu";
-import { GpuBoids, GpuCapacity } from "./gpu";
+import { GpuBoids, GpuCapacity, gpuBoundForCount } from "./gpu";
 import type { CpuBoidsParams } from "./cpu";
 
 // Per-mode count ceilings.
-const CpuCapacity = 3_000;   // CPU physics is O(n) per frame — keep it modest
-const GpuMax      = GpuCapacity;   // 200k — spatial-grid compute on the GPU
+const CpuCapacity = 3_000;         // CPU physics is O(n) per frame — keep it modest
+const GpuMax      = GpuCapacity;   // 200k — spatial-grid compute + GPU-driven render
 
 export function buildSimScene(
   engine: EngineContext,
@@ -30,25 +31,20 @@ export function buildSimScene(
   const detach = attachControl(camera, canvas, scene);
   addToScene(scene, createHemisphericLight([0, 1, 0], 0.9));
 
-  // ── GPU compute system ────────────────────────────────────────────────────
-  const gpu = new GpuBoids(engine);
-  const gpuAvailable = gpu.ok;
+  // ── CPU path: its own PBR + AgentBuffer capsule mesh ──────────────────────
+  const cpuMesh = createCapsule(engine, { height: 1.2, radius: 0.35, tessellation: 6 });
+  cpuMesh.material = createPbrMaterial({ baseColorFactor: [0.05, 0.8, 1, 1], metallicFactor: 0.2, roughnessFactor: 0.5 });
+  addToScene(scene, cpuMesh);
 
-  // ── Shared rendering mesh + AgentBuffer ───────────────────────────────────
-  // One mesh, one AgentBuffer — used for BOTH CPU and GPU paths.
-  // Capacity is GpuCapacity when GPU is available (for tens of thousands).
-  const renderCapacity = gpuAvailable ? GpuCapacity : CpuCapacity;
+  const agentBuf = new AgentBuffer(CpuCapacity);
+  agentBuf.attach(engine, cpuMesh);
 
-  const mesh = createCapsule(engine, { height: 1.2, radius: 0.35, tessellation: 6 });
-  mesh.material = createPbrMaterial({ baseColorFactor: [0.05, 0.8, 1, 1], metallicFactor: 0.2, roughnessFactor: 0.5 });
-  addToScene(scene, mesh);
-
-  const agentBuf = new AgentBuffer(renderCapacity);
-  agentBuf.attach(engine, mesh);
-
-  // ── CPU physics ────────────────────────────────────────────────────────────
   const cpu = new CpuBoids(CpuCapacity);
   cpu.spawnAll();
+
+  // ── GPU path: GpuBoids owns its own compute-driven PBR mesh ───────────────
+  const gpu = new GpuBoids(engine, scene);
+  const gpuAvailable = gpu.ok;
 
   // ── Shared params ─────────────────────────────────────────────────────────
   const params = reactive({
@@ -60,14 +56,15 @@ export function buildSimScene(
     radius: 5.0,
     separationRadius: 2.0,
     gpuMode: false,
+    collision: false,
+    collisionRadius: 0.4,
+    collisionStrength: 0.5,
   });
 
   const agentsRef = ref<number | string>(params.count);
   const modeRef   = ref<string>("CPU");
 
-  // Reactive count slider — its `max` swaps between CpuCapacity and GpuMax with
-  // the active mode. ControlPanel binds :max="def.max", so mutating it here
-  // updates the slider range live.
+  // Reactive count slider — `max` swaps between CpuCapacity and GpuMax with mode.
   const countSlider = reactive<SliderParam>({
     type: "slider",
     key: "count",
@@ -77,9 +74,14 @@ export function buildSimScene(
     step: 10,
   });
 
-  let prevCount = params.count;
-  let prevGpu   = false;
+  let prevGpu         = false;
+  let prevGpuCount    = -1;  // last count pushed to gpu.setCount
   let readbackPending = false;
+
+  // Frame the camera to the density-scaled GPU world so the whole flock is visible.
+  function frameGpu(n: number): void {
+    camera.radius = Math.max(45, gpuBoundForCount(n) * 2.4);
+  }
 
   // ── Mode switch helpers ───────────────────────────────────────────────────
 
@@ -89,18 +91,27 @@ export function buildSimScene(
       return;
     }
     modeRef.value = "GPU";
-    countSlider.max = GpuMax;   // unlock the full GPU range
-    // Seed the GPU state from current CPU positions so the flock continues.
-    gpu.seedFrom(params.count, cpu.px, cpu.py, cpu.pz, cpu.vx, cpu.vy, cpu.vz);
+    countSlider.max = GpuMax;
+    // Hide the CPU mesh and drop its stale bundle.
+    setThinInstanceCount(cpuMesh, 0);
     invalidateRenderBundles(engine);
+    // Seamless: seed GPU state from the current CPU flock, keep the count.
+    gpu.setCount(params.count);
+    gpu.seedFrom(params.count, cpu.px, cpu.py, cpu.pz, cpu.vx, cpu.vy, cpu.vz);
+    prevGpuCount = params.count;
+    frameGpu(params.count);
   }
 
   function switchToCpu(): void {
     if (readbackPending) return;
     modeRef.value = "CPU";
-    // Clamp the slider range and snap an over-CPU-cap count back down.
+    // Clamp the slider range and snap an over-CPU-cap count down.
     countSlider.max = CpuCapacity;
     if (params.count > CpuCapacity) params.count = CpuCapacity;
+    // Hide the GPU mesh.
+    gpu.setCount(0);
+    prevGpuCount = 0;
+
     if (!gpuAvailable) return;
 
     // Async GPU→CPU handoff so the flock continues seamlessly.
@@ -120,20 +131,15 @@ export function buildSimScene(
     // React to mode toggle
     if (isGpu !== prevGpu) {
       prevGpu = isGpu;
-      if (isGpu) {
-        switchToGpu();
-      } else {
-        switchToCpu();
-      }
+      if (isGpu) switchToGpu();
+      else       switchToCpu();
     }
 
     if (!isGpu || readbackPending) {
-      // ── CPU physics path ────────────────────────────────────────────────
+      // ── CPU physics path (writes AgentBuffer, PBR renders it) ────────────
+      // All slots are pre-spawned by spawnAll(), so raising the count simply
+      // reveals already-initialized boids — no per-frame respawn needed.
       const cpuCount = Math.min(n, CpuCapacity);
-      if (cpuCount !== prevCount) {
-        for (let i = prevCount; i < cpuCount; i++) cpu.spawnOne(i);
-        prevCount = cpuCount;
-      }
       const cpuParams: CpuBoidsParams = {
         count: cpuCount,
         speed: params.speed,
@@ -142,13 +148,23 @@ export function buildSimScene(
         cohesion: params.cohesion,
         radius: params.radius,
         separationRadius: params.separationRadius,
+        collision: params.collision,
+        collisionRadius: params.collisionRadius,
+        collisionStrength: params.collisionStrength,
       };
-      cpu.update(dt, cpuParams, agentBuf, mesh);
+      cpu.update(dt, cpuParams, agentBuf, cpuMesh);
       agentsRef.value = cpuCount;
       modeRef.value   = "CPU";
     } else {
-      // ── GPU physics path ────────────────────────────────────────────────
-      // Dispatch compute (spatial-grid physics, O(n) neighbor search).
+      // ── GPU physics + GPU-driven render (no readback) ────────────────────
+      // Count changes (committed on slider release) re-spread the flock across
+      // the density-scaled world and reframe the camera.
+      if (n !== prevGpuCount) {
+        gpu.setCount(n);
+        gpu.spawnSpread(n);
+        frameGpu(n);
+        prevGpuCount = n;
+      }
       gpu.dispatch(dt, {
         count: n,
         speed: params.speed,
@@ -157,23 +173,10 @@ export function buildSimScene(
         cohesion: params.cohesion,
         radius: params.radius,
         separationRadius: params.separationRadius,
+        collision: params.collision,
+        collisionRadius: params.collisionRadius,
+        collisionStrength: params.collisionStrength,
       });
-
-      // Consume the latest async readback data (populated ~1 frame after dispatch).
-      // seedFrom() pre-populates the arrays so the first frame shows something.
-      const rbCount = gpu.readbackCount;
-      if (rbCount > 0) {
-        const spd = params.speed;
-        for (let i = 0; i < rbCount; i++) {
-          const vLen = Math.sqrt(gpu.vx[i] ** 2 + gpu.vy[i] ** 2 + gpu.vz[i] ** 2);
-          const [qx, qy, qz, qw] = upToDirQuat(gpu.vx[i], gpu.vy[i], gpu.vz[i]);
-          agentBuf.writeTransform(i, gpu.px[i], gpu.py[i], gpu.pz[i], qx, qy, qz, qw, 1, 1, 1);
-          const t = Math.min(vLen / (spd * 1.5), 1);
-          agentBuf.writeColor(i, t, 1 - t * 0.8, 1 - t * 0.4);
-        }
-        agentBuf.commit(mesh, rbCount);
-      }
-
       agentsRef.value = n;
       modeRef.value   = "GPU";
     }
@@ -181,7 +184,6 @@ export function buildSimScene(
 
   function reset(): void {
     cpu.spawnAll();
-    prevCount = params.count;
     agentsRef.value = params.count;
     if (params.gpuMode && gpuAvailable) {
       gpu.seedFrom(params.count, cpu.px, cpu.py, cpu.pz, cpu.vx, cpu.vy, cpu.vz);
@@ -197,12 +199,15 @@ export function buildSimScene(
         label: gpuAvailable ? "GPU Mode" : "GPU Mode (unavailable)",
       },
       countSlider,
-      { type: "slider", key: "speed",            label: "Speed",           min: 1,   max: 20,       step: 0.5 },
-      { type: "slider", key: "radius",           label: "Neighbor Radius", min: 1,   max: 15,       step: 0.5 },
-      { type: "slider", key: "separationRadius", label: "Sep. Radius",     min: 0.5, max: 6,        step: 0.25 },
-      { type: "slider", key: "separation",       label: "Separation",      min: 0,   max: 5,        step: 0.1 },
-      { type: "slider", key: "alignment",        label: "Alignment",       min: 0,   max: 5,        step: 0.1 },
-      { type: "slider", key: "cohesion",         label: "Cohesion",        min: 0,   max: 5,        step: 0.1 },
+      { type: "slider", key: "speed",            label: "Speed",           min: 1,   max: 20, step: 0.5 },
+      { type: "slider", key: "radius",           label: "Neighbor Radius", min: 1,   max: 15, step: 0.5 },
+      { type: "slider", key: "separationRadius", label: "Sep. Radius",     min: 0.5, max: 6,  step: 0.25 },
+      { type: "slider", key: "separation",       label: "Separation",      min: 0,   max: 5,  step: 0.1 },
+      { type: "slider", key: "alignment",        label: "Alignment",       min: 0,   max: 5,  step: 0.1 },
+      { type: "slider", key: "cohesion",         label: "Cohesion",        min: 0,   max: 5,  step: 0.1 },
+      { type: "toggle", key: "collision",        label: "Collision" },
+      { type: "slider", key: "collisionRadius",  label: "Collide Radius",  min: 0.2, max: 1.5, step: 0.05 },
+      { type: "slider", key: "collisionStrength",label: "Collide Strength",min: 0,   max: 1,   step: 0.05 },
     ],
     readouts: {
       mode: modeRef,
