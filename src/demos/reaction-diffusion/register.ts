@@ -4,8 +4,9 @@ import source from "./scene.ts?raw";
 
 registerDemo({
   id: "reaction-diffusion",
+  badges: ["CPU", "GPU"],
   title: "Reaction–Diffusion",
-  description: "Gray-Scott model: coral, stripes, spots, maze",
+  description: "CPU or GPU Gray-Scott reaction-diffusion — scalable grid up to 4096×4096",
   component: defineAsyncComponent(() => import("./ReactionDiffusion.vue")),
   source,
 });

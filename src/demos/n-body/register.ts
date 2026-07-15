@@ -5,7 +5,8 @@ import source from "./scene.ts?raw";
 registerDemo({
   id: "n-body",
   title: "N-Body Gravity",
-  description: "Gravitational simulation with orbital trails",
+  description: "CPU or GPU gravity — tiled O(n²), up to 8192 bodies with orbital trails",
   component: defineAsyncComponent(() => import("./NBody.vue")),
   source,
+  badges: ["CPU", "GPU"],
 });

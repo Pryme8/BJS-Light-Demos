@@ -1,6 +1,7 @@
 import { ref, shallowRef, type Ref } from "vue";
 import { onBeforeRender } from "@babylonjs/lite";
 import { useLiteScene } from "@/composables/useLiteScene";
+import { activeMode } from "@/lib/active-mode";
 import type { BuildSimSceneFn, SimControls, SimHandle } from "@/types/sim";
 
 export function useSimulation(
@@ -18,6 +19,12 @@ export function useSimulation(
     const h = await buildSimScene(engine, scene, canvas);
     handle.value = h;
 
+    // Demos that support both a CPU and GPU path expose a boolean
+    // `params.gpuMode`; publish it so the sidebar badge reflects the mode
+    // this demo is actually running in, not just that GPU is available.
+    const gpuModeOf = () => (h.params as { gpuMode?: boolean }).gpuMode;
+    if (typeof gpuModeOf() === "boolean") activeMode.gpuMode = gpuModeOf()!;
+
     onBeforeRender(scene, (dt) => {
       fpsAccum += dt;
       fpsFrames++;
@@ -26,6 +33,8 @@ export function useSimulation(
         fpsFrames = 0;
         fpsAccum = 0;
       }
+      const g = gpuModeOf();
+      if (typeof g === "boolean") activeMode.gpuMode = g;
       if (running.value) h.update(dt);
     });
 

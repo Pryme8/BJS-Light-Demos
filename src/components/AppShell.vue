@@ -2,12 +2,25 @@
 import { computed } from "vue";
 import { useRoute } from "vue-router";
 import { getDemoRegistry } from "@/demos/registry";
+import { activeMode } from "@/lib/active-mode";
 
 const route = useRoute();
 const demos = computed(() => getDemoRegistry());
 
 function isActive(id: string) {
   return route.path === `/demo/${id}`;
+}
+
+/**
+ * Only the demo matching the current route actually has a running mode; for
+ * every other row the badges are just static capability labels, so neither
+ * is "lit". For the active row, light whichever badge matches the demo's
+ * live `params.gpuMode` (published to `activeMode` by useSimulation).
+ */
+function badgeClass(demoId: string, badge: string): string {
+  if (!isActive(demoId)) return "shell__nav-badge--dim";
+  const isGpuBadge = badge === "GPU";
+  return isGpuBadge === activeMode.gpuMode ? "shell__nav-badge--lit" : "shell__nav-badge--dim";
 }
 </script>
 
@@ -38,7 +51,7 @@ function isActive(id: string) {
                   v-for="badge in demo.badges"
                   :key="badge"
                   class="shell__nav-badge"
-                  :class="badge === 'GPU' ? 'shell__nav-badge--gpu' : 'shell__nav-badge--cpu'"
+                  :class="badgeClass(demo.id, badge)"
                 >{{ badge }}</span>
               </span>
             </span>
@@ -201,23 +214,18 @@ function isActive(id: string) {
   flex-shrink: 0;
 }
 
-.shell__nav-badge--gpu {
+.shell__nav-badge--lit {
   color: var(--cyan);
   border: 1px solid var(--cyan-dim);
 }
 
-.shell__nav-badge--cpu {
+.shell__nav-badge--dim {
   color: var(--text-muted);
   border: 1px solid var(--border-dim);
 }
 
 .shell__nav-item--active .shell__nav-title {
   color: var(--cyan);
-}
-
-.shell__nav-item--active .shell__nav-badge--cpu {
-  color: var(--cyan-dim);
-  border-color: var(--cyan-dim);
 }
 
 .shell__nav-desc {
