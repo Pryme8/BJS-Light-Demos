@@ -5,7 +5,8 @@ import source from "./scene.ts?raw";
 registerDemo({
   id: "boids-vs-predator",
   title: "Boids vs Predator",
-  description: "Agent-based ecosystem — food, hunger, starvation & reproduction",
+  description: "CPU or GPU ecosystem — prey flock & flee, predators hunt, true birth/death",
+  badges: ["CPU", "GPU"],
   component: defineAsyncComponent(() => import("./BoidsVsPredator.vue")),
   source,
 });

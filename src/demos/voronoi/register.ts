@@ -4,8 +4,9 @@ import source from "./scene.ts?raw";
 
 registerDemo({
   id: "voronoi",
-  title: "Voronoi Diagram",
-  description: "Territory coloring with animated seeds + Lloyd relaxation",
+  title: "Voronoi Landscape",
+  description: "CPU or GPU 3D Voronoi terrain — ridge, cone, mesa, noise · up to 512×512",
+  badges: ["CPU", "GPU"],
   component: defineAsyncComponent(() => import("./Voronoi.vue")),
   source,
 });

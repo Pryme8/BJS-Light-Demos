@@ -11,7 +11,7 @@ const sim = useSimulation(canvasRef, buildSimScene);
 </script>
 
 <template>
-  <DemoViewport v-model:canvas="canvasRef" title="Voronoi Diagram" description="Nearest-seed coloring · Lloyd relaxation · animated seeds" :source="source">
+  <DemoViewport v-model:canvas="canvasRef" title="Voronoi Landscape" description="CPU or GPU 3D Voronoi terrain · ridge / cone / mesa / noise · up to 512×512" :source="source">
     <template #overlay>
       <ControlPanel v-if="sim.handle.value" :schema="sim.handle.value.schema" :params="sim.handle.value.params" :readouts="sim.handle.value.readouts" :fps="sim.fps.value" :running="sim.running.value" @play="sim.play()" @pause="sim.pause()" @step="sim.step()" @reset="sim.reset()" />
     </template>
